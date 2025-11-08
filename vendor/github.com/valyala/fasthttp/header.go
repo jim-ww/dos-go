@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"iter"
-	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,8 +47,9 @@ type header struct {
 // ResponseHeader instance MUST NOT be used from concurrently running
 // goroutines.
 type ResponseHeader struct {
-	noCopy noCopy
 	header
+
+	noCopy noCopy
 
 	statusMessage   []byte
 	contentEncoding []byte
@@ -68,8 +68,9 @@ type ResponseHeader struct {
 // RequestHeader instance MUST NOT be used from concurrently running
 // goroutines.
 type RequestHeader struct {
-	noCopy noCopy
 	header
+
+	noCopy noCopy
 
 	method     []byte
 	requestURI []byte
@@ -194,7 +195,33 @@ func (h *ResponseHeader) PeekCookie(key string) []byte {
 // It may be negative:
 // -1 means Transfer-Encoding: chunked.
 // -2 means Transfer-Encoding: identity.
-func (h *header) ContentLength() int {
+func (h *ResponseHeader) ContentLength() int {
+	return h.contentLength
+}
+
+// ContentLength returns Content-Length header value.
+//
+// It may be negative:
+// -1 means Transfer-Encoding: chunked.
+// -2 means Transfer-Encoding: identity.
+func (h *RequestHeader) ContentLength() int {
+	if h.disableSpecialHeader {
+		// Parse Content-Length from raw headers when special headers are disabled
+		v := peekArgBytes(h.h, strContentLength)
+		if len(v) == 0 {
+			// Check for Transfer-Encoding: chunked
+			te := peekArgBytes(h.h, strTransferEncoding)
+			if bytes.Equal(te, strChunked) {
+				return -1 // chunked
+			}
+			return -2 // identity
+		}
+		n, err := parseContentLength(v)
+		if err != nil {
+			return -2 // identity on parse error
+		}
+		return n
+	}
 	return h.contentLength
 }
 
@@ -499,6 +526,35 @@ func validHeaderFieldByte(c byte) bool {
 // as defined by RFC 7230.
 func validHeaderValueByte(c byte) bool {
 	return validHeaderValueByteTable[c] == 1
+}
+
+// isValidHeaderKey returns true if a is a valid header key.
+func isValidHeaderKey(a []byte) bool {
+	if len(a) == 0 {
+		return false
+	}
+
+	// See if a looks like a header key. If not, return it unchanged.
+	noCanon := false
+	for _, c := range a {
+		if validHeaderFieldByte(c) {
+			continue
+		}
+		// Don't canonicalize.
+		if c == ' ' {
+			// We accept invalid headers with a space before the
+			// colon, but must not canonicalize them.
+			// See https://go.dev/issue/34540.
+			noCanon = true
+			continue
+		}
+		return false
+	}
+	if noCanon {
+		return true
+	}
+
+	return true
 }
 
 // VisitHeaderParams calls f for each parameter in the given header bytes.
@@ -1966,9 +2022,25 @@ func (h *ResponseHeader) peekAll(key []byte) [][]byte {
 // either though ReleaseRequest or your request handler returning.
 // Any future calls to the Peek* will modify the returned value.
 // Do not store references to returned value. Make copies instead.
-func (h *header) PeekKeys() [][]byte {
+func (h *RequestHeader) PeekKeys() [][]byte {
 	h.mulHeader = h.mulHeader[:0]
-	h.mulHeader = peekArgsKeys(h.mulHeader, h.h)
+	for key := range h.All() {
+		h.mulHeader = append(h.mulHeader, key)
+	}
+	return h.mulHeader
+}
+
+// PeekKeys return all header keys.
+//
+// The returned value is valid until the request is released,
+// either though ReleaseRequest or your request handler returning.
+// Any future calls to the Peek* will modify the returned value.
+// Do not store references to returned value. Make copies instead.
+func (h *ResponseHeader) PeekKeys() [][]byte {
+	h.mulHeader = h.mulHeader[:0]
+	for key := range h.All() {
+		h.mulHeader = append(h.mulHeader, key)
+	}
 	return h.mulHeader
 }
 
@@ -1979,8 +2051,7 @@ func (h *header) PeekKeys() [][]byte {
 // Any future calls to the Peek* will modify the returned value.
 // Do not store references to returned value. Make copies instead.
 func (h *header) PeekTrailerKeys() [][]byte {
-	h.mulHeader = copyTrailer(h.mulHeader, h.trailer)
-	return h.mulHeader
+	return h.trailer
 }
 
 // Cookie returns cookie for the given key.
@@ -2105,8 +2176,8 @@ func (h *header) tryReadTrailer(r *bufio.Reader, n int) error {
 		return fmt.Errorf("error when reading response trailer: %w", err)
 	}
 	b = mustPeekBuffered(r)
-	trailers, headersLen, errParse := parseTrailer(b, h.h, h.disableNormalizing)
-	h.h = trailers
+	hh, headersLen, errParse := parseTrailer(b, h.h, h.disableNormalizing)
+	h.h = hh
 	if errParse != nil {
 		if err == io.EOF {
 			return err
@@ -2599,7 +2670,7 @@ func parseTrailer(src []byte, dest []argsKV, disableNormalizing bool) ([]argsKV,
 	if s.err != nil {
 		return dest, 0, s.err
 	}
-	return dest, s.hLen, nil
+	return dest, s.r, nil
 }
 
 func isBadTrailer(key []byte) bool {
@@ -2611,24 +2682,30 @@ func isBadTrailer(key []byte) bool {
 	case 'a':
 		return caseInsensitiveCompare(key, strAuthorization)
 	case 'c':
-		if len(key) > len(HeaderContentType) && caseInsensitiveCompare(key[:8], strContentType[:8]) {
+		// Security fix: Changed > to >= to properly block Content-Type header in trailers
+		if len(key) >= len(HeaderContentType) && caseInsensitiveCompare(key[:8], strContentType[:8]) {
 			// skip compare prefix 'Content-'
 			return caseInsensitiveCompare(key[8:], strContentEncoding[8:]) ||
 				caseInsensitiveCompare(key[8:], strContentLength[8:]) ||
 				caseInsensitiveCompare(key[8:], strContentType[8:]) ||
 				caseInsensitiveCompare(key[8:], strContentRange[8:])
 		}
-		return caseInsensitiveCompare(key, strConnection)
+		return caseInsensitiveCompare(key, strConnection) ||
+			// Security: Block Cookie header in trailers to prevent session hijacking
+			caseInsensitiveCompare(key, strCookie)
 	case 'e':
 		return caseInsensitiveCompare(key, strExpect)
 	case 'h':
 		return caseInsensitiveCompare(key, strHost)
 	case 'k':
 		return caseInsensitiveCompare(key, strKeepAlive)
+	case 'l':
+		// Security: Block Location header in trailers to prevent redirect attacks
+		return caseInsensitiveCompare(key, strLocation)
 	case 'm':
 		return caseInsensitiveCompare(key, strMaxForwards)
 	case 'p':
-		if len(key) > len(HeaderProxyConnection) && caseInsensitiveCompare(key[:6], strProxyConnection[:6]) {
+		if len(key) >= len(HeaderProxyConnection) && caseInsensitiveCompare(key[:6], strProxyConnection[:6]) {
 			// skip compare prefix 'Proxy-'
 			return caseInsensitiveCompare(key[6:], strProxyConnection[6:]) ||
 				caseInsensitiveCompare(key[6:], strProxyAuthenticate[6:]) ||
@@ -2636,12 +2713,19 @@ func isBadTrailer(key []byte) bool {
 		}
 	case 'r':
 		return caseInsensitiveCompare(key, strRange)
+	case 's':
+		// Security: Block Set-Cookie header in trailers
+		return caseInsensitiveCompare(key, strSetCookie)
 	case 't':
 		return caseInsensitiveCompare(key, strTE) ||
 			caseInsensitiveCompare(key, strTrailer) ||
 			caseInsensitiveCompare(key, strTransferEncoding)
 	case 'w':
 		return caseInsensitiveCompare(key, strWWWAuthenticate)
+	case 'x':
+		// Security: Block X-Forwarded-* and X-Real-IP headers to prevent IP spoofing
+		return (len(key) >= 11 && caseInsensitiveCompare(key[:11], []byte("x-forwarded"))) ||
+			(len(key) >= 9 && caseInsensitiveCompare(key[:9], []byte("x-real-ip")))
 	}
 	return false
 }
@@ -2726,8 +2810,16 @@ func (h *RequestHeader) parseFirstLine(buf []byte) (int, error) {
 
 	b = b[n+1:]
 
-	// parse requestURI
-	n = bytes.LastIndexByte(b, ' ')
+	// Check for extra whitespace after method - only one space should separate method from URI
+	if len(b) > 0 && b[0] == ' ' {
+		if h.secureErrorLogMessage {
+			return 0, errors.New("extra whitespace in request line")
+		}
+		return 0, fmt.Errorf("extra whitespace in request line %q", buf)
+	}
+
+	// parse requestURI - RFC 9112 requires exactly one space between components
+	n = bytes.IndexByte(b, ' ')
 	if n < 0 {
 		return 0, fmt.Errorf("cannot find whitespace in the first line of request %q", buf)
 	} else if n == 0 {
@@ -2735,6 +2827,14 @@ func (h *RequestHeader) parseFirstLine(buf []byte) (int, error) {
 			return 0, errors.New("requestURI cannot be empty")
 		}
 		return 0, fmt.Errorf("requestURI cannot be empty in %q", buf)
+	}
+
+	// Check for extra whitespace - only one space should separate URI from HTTP version
+	if n+1 < len(b) && b[n+1] == ' ' {
+		if h.secureErrorLogMessage {
+			return 0, errors.New("extra whitespace in request line")
+		}
+		return 0, fmt.Errorf("extra whitespace in request line %q", buf)
 	}
 
 	protoStr := b[n+1:]
@@ -2916,7 +3016,7 @@ func (h *ResponseHeader) parseHeaders(buf []byte) (int, error) {
 		h.connectionClose = !hasHeaderValue(v, strKeepAlive)
 	}
 
-	return len(buf) - len(s.b), nil
+	return s.r, nil
 }
 
 func (h *RequestHeader) parseHeaders(buf []byte) (int, error) {
@@ -3046,7 +3146,7 @@ func (h *RequestHeader) parseHeaders(buf []byte) (int, error) {
 		v := peekArgBytes(h.h, strConnection)
 		h.connectionClose = !hasHeaderValue(v, strKeepAlive)
 	}
-	return s.hLen, nil
+	return s.r, nil
 }
 
 func (h *RequestHeader) collectCookies() {
@@ -3080,164 +3180,6 @@ func parseContentLength(b []byte) (int, error) {
 		return -1, fmt.Errorf("cannot parse Content-Length: %w", errNonNumericChars)
 	}
 	return v, nil
-}
-
-type headerScanner struct {
-	err error
-
-	b     []byte
-	key   []byte
-	value []byte
-
-	// hLen stores header subslice len
-	hLen int
-
-	// by checking whether the next line contains a colon or not to tell
-	// it's a header entry or a multi line value of current header entry.
-	// the side effect of this operation is that we know the index of the
-	// next colon and new line, so this can be used during next iteration,
-	// instead of find them again.
-	nextColon   int
-	nextNewLine int
-
-	initialized bool
-
-	// This is only used to print the deprecated newline separator warning.
-	// TODO: Remove this again once the newline separator is removed.
-	warned bool
-}
-
-// DeprecatedNewlineIncludeContext is used to control whether the context of the
-// header is included in the warning message about the deprecated newline
-// separator.
-// Warning: this can potentially leak sensitive information such as auth headers.
-var DeprecatedNewlineIncludeContext atomic.Bool
-
-// TODO: Remove this again once the newline separator is removed.
-var warnedAboutDeprecatedNewlineSeparatorLimiter atomic.Int64
-
-func (s *headerScanner) next() bool {
-	if !s.initialized {
-		s.nextColon = -1
-		s.nextNewLine = -1
-		s.initialized = true
-	}
-	bLen := len(s.b)
-	if bLen >= 2 && s.b[0] == rChar && s.b[1] == nChar {
-		s.b = s.b[2:]
-		s.hLen += 2
-		return false
-	}
-	if bLen >= 1 && s.b[0] == nChar {
-		s.b = s.b[1:]
-		s.hLen++
-		return false
-	}
-	var n int
-	if s.nextColon >= 0 {
-		n = s.nextColon
-		s.nextColon = -1
-	} else {
-		n = bytes.IndexByte(s.b, ':')
-
-		// There can't be a \n inside the header name, check for this.
-		x := bytes.IndexByte(s.b, nChar)
-		if x < 0 {
-			// A header name should always at some point be followed by a \n
-			// even if it's the one that terminates the header block.
-			s.err = errNeedMore
-			return false
-		}
-		if x < n {
-			// There was a \n before the :
-			s.err = errInvalidName
-			return false
-		}
-
-		// If the character before '\n' isn't '\r', print a warning.
-		if !s.warned && x > 1 && s.b[x-1] != rChar {
-			// Only warn once per second.
-			now := time.Now().Unix()
-			if warnedAboutDeprecatedNewlineSeparatorLimiter.Load() < now {
-				if warnedAboutDeprecatedNewlineSeparatorLimiter.Swap(now) < now {
-					if DeprecatedNewlineIncludeContext.Load() {
-						// Include 20 characters after the '\n'.
-						xx := x + 20
-						if len(s.b) < xx {
-							xx = len(s.b)
-						}
-						slog.Error("Deprecated newline only separator found in header", "context", fmt.Sprintf("%q", s.b[:xx]))
-					} else {
-						slog.Error("Deprecated newline only separator found in header")
-					}
-					s.warned = true
-				}
-			}
-		}
-	}
-	if n < 0 {
-		s.err = errNeedMore
-		return false
-	}
-	s.key = s.b[:n]
-	n++
-	for len(s.b) > n && (s.b[n] == ' ' || s.b[n] == '\t') {
-		n++
-		// the newline index is a relative index, and lines below trimmed `s.b` by `n`,
-		// so the relative newline index also shifted forward. it's safe to decrease
-		// to a minus value, it means it's invalid, and will find the newline again.
-		s.nextNewLine--
-	}
-	s.hLen += n
-	s.b = s.b[n:]
-	if s.nextNewLine >= 0 {
-		n = s.nextNewLine
-		s.nextNewLine = -1
-	} else {
-		n = bytes.IndexByte(s.b, nChar)
-	}
-	if n < 0 {
-		s.err = errNeedMore
-		return false
-	}
-	for n+1 < len(s.b) {
-		if s.b[n+1] != ' ' && s.b[n+1] != '\t' {
-			break
-		}
-		d := bytes.IndexByte(s.b[n+1:], nChar)
-		if d <= 0 {
-			break
-		} else if d == 1 && s.b[n+1] == rChar {
-			break
-		}
-		e := n + d + 1
-		if c := bytes.IndexByte(s.b[n+1:e], ':'); c >= 0 {
-			s.nextColon = c
-			s.nextNewLine = d - c - 1
-			break
-		}
-		n = e
-	}
-	if n >= len(s.b) {
-		s.err = errNeedMore
-		return false
-	}
-	s.value = s.b[:n]
-	s.hLen += n + 1
-	s.b = s.b[n+1:]
-
-	if n > 0 && s.value[n-1] == rChar {
-		n--
-	}
-	for n > 0 && (s.value[n-1] == ' ' || s.value[n-1] == '\t') {
-		n--
-	}
-	s.value = s.value[:n]
-	if bytes.Contains(s.b, strCRLF) {
-		s.value = normalizeHeaderValue(s.value)
-	}
-
-	return true
 }
 
 type headerValueScanner struct {
@@ -3308,46 +3250,6 @@ func getHeaderKeyBytes(bufK []byte, key string, disableNormalizing bool) []byte 
 	return bufK
 }
 
-func normalizeHeaderValue(ov []byte) (nv []byte) {
-	nv = ov
-	length := len(ov)
-	if length <= 0 {
-		return
-	}
-	write := 0
-	shrunk := 0
-	once := false
-	lineStart := false
-	for read := 0; read < length; read++ {
-		c := ov[read]
-		switch {
-		case c == rChar || c == nChar:
-			shrunk++
-			if c == nChar {
-				lineStart = true
-				once = false
-			}
-			continue
-		case lineStart && (c == '\t' || c == ' '):
-			if !once {
-				c = ' '
-				once = true
-			} else {
-				shrunk++
-				continue
-			}
-		default:
-			lineStart = false
-		}
-		nv[write] = c
-		write++
-	}
-
-	nv = nv[:length-shrunk]
-
-	return
-}
-
 func normalizeHeaderKey(b []byte, disableNormalizing bool) {
 	if disableNormalizing {
 		return
@@ -3358,17 +3260,22 @@ func normalizeHeaderKey(b []byte, disableNormalizing bool) {
 		return
 	}
 
-	b[0] = toUpperTable[b[0]]
-	for i := 1; i < n; i++ {
-		p := &b[i]
-		if *p == '-' {
-			i++
-			if i < n {
-				b[i] = toUpperTable[b[i]]
-			}
-			continue
+	// If the header isn't valid, we don't normalize it.
+	for _, c := range b {
+		if !validHeaderFieldByte(c) {
+			return
 		}
-		*p = toLowerTable[*p]
+	}
+
+	upper := true
+	for i, c := range b {
+		if upper {
+			c = toUpperTable[c]
+		} else {
+			c = toLowerTable[c]
+		}
+		upper = c == '-'
+		b[i] = c
 	}
 }
 
@@ -3445,14 +3352,19 @@ func appendTrailerBytes(dst []byte, trailer [][]byte, sep []byte) []byte {
 }
 
 func copyTrailer(dst, src [][]byte) [][]byte {
-	if cap(dst) > len(src) {
+	if cap(dst) >= len(src) {
 		dst = dst[:len(src)]
 	} else {
 		dst = append(dst[:0], src...)
 	}
 
 	for i := range dst {
-		dst[i] = make([]byte, len(src[i]))
+		l := len(src[i])
+		if cap(dst[i]) >= l {
+			dst[i] = dst[i][:l]
+		} else {
+			dst[i] = make([]byte, l)
+		}
 		copy(dst[i], src[i])
 	}
 	return dst
@@ -3460,7 +3372,6 @@ func copyTrailer(dst, src [][]byte) [][]byte {
 
 var (
 	errNeedMore    = errors.New("need more data: cannot find trailing lf")
-	errInvalidName = errors.New("invalid header name")
 	errSmallBuffer = errors.New("small read buffer. Increase ReadBufferSize")
 )
 

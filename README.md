@@ -4,7 +4,7 @@ A high-performance HTTP load testing tool written in Go, designed for network th
 
 ## Features
 
-- **Minimal** (under 200 LoC)
+- **Minimal**
 - **Blazing fast** - Utilizes fasthttp's optimized HTTP client implementation
 - **Lightweight logging** - Zerolog provides minimal-overhead structured logging
 - Multi-threaded requests with goroutine pooling
