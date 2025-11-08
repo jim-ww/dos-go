@@ -27,6 +27,7 @@ var (
 	printVersion           = flag.Bool("version", false, "print version")
 	targetURL              = flag.String("url", "", "url address of target to send requests to")
 	method                 = flag.String("method", fasthttp.MethodGet, "HTTP method to use")
+	randomMethod           = flag.Bool("random_method", false, "randomize HTTP method")
 	delayBetweenRequests   = flag.Duration("delay", 0, "delay between requests")
 	maxGoroutines          = flag.Int("max_goroutines", 10, "limit of maximum goroutines count")
 	requestTimeout         = flag.Duration("request_timeout", time.Second*10, "timeout for each request")
@@ -141,7 +142,7 @@ func main() {
 				}
 				select {
 				case sem <- struct{}{}:
-					go sendRequest(ctx, sem, respChan, *requestTimeout)
+					go sendRequest(ctx, sem, respChan, *requestTimeout, allowedHTTPMethods)
 				case <-ctx.Done():
 					return
 				}
@@ -180,7 +181,7 @@ type Result struct {
 	duration time.Duration
 }
 
-func sendRequest(ctx context.Context, sem <-chan struct{}, respChan chan<- *Result, requestTimeout time.Duration) {
+func sendRequest(ctx context.Context, sem <-chan struct{}, respChan chan<- *Result, requestTimeout time.Duration, allowedHTTPMethods []string) {
 	defer func() {
 		select {
 		case <-sem:
@@ -192,7 +193,12 @@ func sendRequest(ctx context.Context, sem <-chan struct{}, respChan chan<- *Resu
 	start := time.Now()
 	req := fasthttp.AcquireRequest()
 	req.SetRequestURI(*targetURL)
-	req.Header.SetMethod(*method)
+	if *randomMethod {
+		randomHTTPMethod := allowedHTTPMethods[rand.Intn(len(allowedHTTPMethods))]
+		req.Header.SetMethod(randomHTTPMethod)
+	} else {
+		req.Header.SetMethod(*method)
+	}
 
 	if len(userAgentList) > 0 {
 		randomUserAgent := userAgentList[rand.Intn(len(userAgentList))]
